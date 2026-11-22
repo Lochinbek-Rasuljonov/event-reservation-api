@@ -1,52 +1,57 @@
-from celery import Celery
-from database import async_session
-from sqlalchemy import select, update
-from models import Reservation, Seat, SeatStatus
-from datetime import datetime
 import asyncio
+import os
 
-celery_app = Celery("tasks", broker="redis://redis:6379/0", backend="redis://redis:6379/0")
+from celery import Celery
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.pool import NullPool
 
-# Periodic task configuration
+from database import make_engine
+from models import Reservation, Seat, SeatStatus, utcnow
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+
+celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
+celery_app.conf.timezone = "UTC"
 celery_app.conf.beat_schedule = {
     "release-expired-holds-every-minute": {
-        "task": "tasks.release_expired_reservations_task",
+        "task": "tasks.release_expired_reservations",
         "schedule": 60.0,
     },
 }
 
-@celery_app.task
-def release_expired_reservations_task():
-    loop = asyncio.get_event_loop()
-    if loop.is_closed():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    loop.run_until_complete(release_expired_reservations())
 
-async def release_expired_reservations():
-    async with async_session() as session:
-        now = datetime.utcnow()
-        # Find active holds (RESERVED) that have passed their expires_at time
-        query = select(Reservation).where(
-            Reservation.expires_at < now,
-            Reservation.is_active == SeatStatus.RESERVED
+async def release_expired_reservations(session: AsyncSession) -> int:
+    """Delete holds whose time ran out and make their seats available again."""
+    expired = (
+        await session.scalars(
+            select(Reservation)
+            .where(Reservation.status == SeatStatus.RESERVED, Reservation.expires_at < utcnow())
+            # Rows a request is already working on are left for the next run
+            .with_for_update(skip_locked=True)
         )
-        result = await session.execute(query)
-        expired = result.scalars().all()
-        
-        if not expired:
-            return f"No expired reservations found at {now}"
+    ).all()
+    for reservation in expired:
+        await session.execute(
+            update(Seat)
+            .where(Seat.id == reservation.seat_id, Seat.status == SeatStatus.RESERVED)
+            .values(status=SeatStatus.AVAILABLE)
+        )
+        await session.delete(reservation)
+    await session.commit()
+    return len(expired)
 
-        for reservation in expired:
-            # Mark reservation as inactive/available (or delete it)
-            await session.delete(reservation)
-            
-            # Reset seat back to AVAILABLE
-            await session.execute(
-                update(Seat)
-                .where(Seat.id == reservation.seat_id)
-                .values(status=SeatStatus.AVAILABLE)
-            )
-        
-        await session.commit()
-        return f"Successfully released {len(expired)} reservations at {now}"
+
+async def _run_release() -> int:
+    # Each task call runs in a fresh event loop, so it gets its own engine without a pool
+    engine = make_engine(poolclass=NullPool)
+    try:
+        async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+            return await release_expired_reservations(session)
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task(name="tasks.release_expired_reservations")
+def release_expired_reservations_task() -> str:
+    return f"Released {asyncio.run(_run_release())} expired holds"
